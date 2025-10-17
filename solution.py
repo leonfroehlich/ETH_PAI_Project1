@@ -5,10 +5,14 @@ import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 import matplotlib.pyplot as plt
 from matplotlib import cm
+from scipy.stats import norm
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import MiniBatchKMeans
+from math import isfinite
 
 
 # Set `EXTENDED_EVALUATION` to `True` in order to visualize your predictions.
-EXTENDED_EVALUATION = True
+EXTENDED_EVALUATION = False
 EVALUATION_GRID_POINTS = 300  # Number of grid points used in extended evaluation
 
 # Cost function constants
@@ -31,14 +35,117 @@ class Model(object):
         self.rng = np.random.default_rng(seed=0)
 
         # TODO: Add custom initialization for your model here if necessary
-        kernel = ConstantKernel(1.0, (1e-3, 1e3)) * RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e2))
+        self._coord_scaler = StandardScaler(with_mean=True, with_std=True)
+        base = RBF(length_scale=np.ones(3), length_scale_bounds=(1e-2, 1e3)) \
+               + RationalQuadratic(alpha=1.0, length_scale=1.0)
+        kernel = ConstantKernel(1.0, (1e-3, 1e3)) * base + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-6, 1e2))
 
+        
         self.gpr = GaussianProcessRegressor(
             kernel = kernel,
             alpha = 1e-10,
             normalize_y = True,
-            random_state = 0
+            random_state = 0,
+            n_restarts_optimizer=8,
+            copy_X_train=False
         )
+
+        # Precompute optimal shift for asymmetric *squared* loss under Normal predictive dist
+        # Solve: c * [W + (1 − W) Φ(c)] = (W − 1) φ(c)
+        self.W = COST_W_UNDERPREDICT / COST_W_NORMAL
+        self.c_star = self._solve_asym_sq_shift(self.W)
+
+        # Subsampling cap for large n; set to None to disable
+        self.max_train_points = 3000
+
+        # Will be set in fit
+        self._X_cols = None
+        self._trained_on_subset_idx = None
+
+    @staticmethod
+    def _g_asym_c(c, W):
+        Phi = norm.cdf(c)
+        phi = norm.pdf(c)
+        A = W + (1.0 - W) * Phi
+        return c * A - (W - 1.0) * phi
+
+    @classmethod
+    def _solve_asym_sq_shift(cls, W: float) -> float:
+        # Handle degenerate case
+        if not isfinite(W) or W <= 1.0:
+            return 0.0
+
+        # Monotone root on [0, c_hi]; pick a biggish upper bound then refine
+        # g(0) = 0*A - (W-1)*phi(0) < 0 ; for large c, g(c) ~ c*W > 0.
+        lo, hi = 0.0, 10.0
+        glo = cls._g_asym_c(lo, W)
+        ghi = cls._g_asym_c(hi, W)
+        # Expand hi if needed
+        while ghi <= 0 and hi < 50:
+            hi *= 1.5
+            ghi = cls._g_asym_c(hi, W)
+
+        # Bisection (robust and fast enough)
+        for _ in range(80):
+            mid = 0.5 * (lo + hi)
+            gm = cls._g_asym_c(mid, W)
+            if gm == 0.0:
+                return mid
+            if gm > 0:
+                hi = mid
+            else:
+                lo = mid
+            if hi - lo < 1e-8:
+                break
+        return 0.5 * (lo + hi)
+    
+    def _build_features(self, coords: np.ndarray, flags: np.ndarray, fit_scaler: bool = False) -> np.ndarray:
+        """Combine coordinates and residential flag into single feature matrix."""
+        coords = np.asarray(coords, dtype=float)
+        flags = flags.astype(float).reshape(-1, 1)
+
+        if fit_scaler:
+            self._coord_scaler.fit(coords)
+        coords_scaled = self._coord_scaler.transform(coords)
+
+        return np.hstack([coords, flags])
+    
+    def _maybe_subsample(self, X: np.ndarray, y: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        n = X.shape[0]
+        if self.max_train_points is None or n <= self.max_train_points:
+            self._trained_on_subset_idx = np.arange(n, dtype=int)
+            return X, y, self._trained_on_subset_idx
+
+        # Cluster on spatial coords to keep geographic coverage; include area flag weakly
+        # Weight area flag so clustering is mostly spatial but still respects zones
+        coords_scaled = X[:, :2]
+        area = X[:, 2:3]
+        z = np.hstack([coords_scaled, 0.2 * area])
+
+        k = self.max_train_points
+        kmeans = MiniBatchKMeans(n_clusters=k, random_state=0, batch_size=2048, n_init=3)
+        labels = kmeans.fit_predict(z)
+
+        # Pick the training point closest to each centroid
+        centers = kmeans.cluster_centers_
+        # For efficiency, map each cluster to nearest member
+        chosen = np.empty(k, dtype=int)
+        # Build index lists per cluster
+        for c in range(k):
+            idx = np.flatnonzero(labels == c)
+            if idx.size == 0:
+                # rare, but just skip
+                chosen[c] = self.rng.integers(0, n)
+                continue
+            # nearest by Euclidean distance in z-space
+            pts = z[idx]
+            dif = pts - centers[c]
+            i_local = np.argmin(np.sum(dif * dif, axis=1))
+            chosen[c] = idx[i_local]
+
+        chosen = np.unique(chosen)
+        self._trained_on_subset_idx = chosen
+        return X[chosen], y[chosen], chosen
 
     # Don't change the name or the signature of this function
     def predict_pollution_concentration(self, test_coordinates: np.ndarray, test_area_flags: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -51,14 +158,16 @@ class Model(object):
             containing your predictions, the GP posterior mean, and the GP posterior stddev (in that order)
         """
 
-        # TODO: Use your GP to estimate the posterior mean and stddev for each city_area here
-        gp_mean = np.zeros(test_coordinates.shape[0], dtype=float)
-        gp_std = np.zeros(test_coordinates.shape[0], dtype=float)
+        X_test = self._build_features(test_coordinates, test_area_flags, fit_scaler=False)
 
-        gp_mean, gp_std = self.gpr.predict(test_coordinates, return_std=True)
+        gp_mean, gp_std = self.gpr.predict(X_test, return_std=True)
 
-        # TODO: Use the GP posterior to form your predictions here
-        predictions = gp_mean
+        # Decision rule: asymmetric squared loss in residential areas
+        predictions = gp_mean.copy()
+        if self.c_star != 0.0:
+            is_res = test_area_flags.astype(bool)
+            # μ + σ c*
+            predictions[is_res] = gp_mean[is_res] + gp_std[is_res] * self.c_star
 
         return predictions, gp_mean, gp_std
 
@@ -72,7 +181,13 @@ class Model(object):
         """
 
         # TODO: Fit your model here
-        self.gpr.fit(train_coordinates, train_targets)
+        X_full = self._build_features(train_coordinates, train_area_flags, fit_scaler=True)
+        y_full = np.asarray(train_targets, dtype=float)
+
+        X_train, y_train, _ = self._maybe_subsample(X_full, y_full)
+
+        self.gpr.fit(X_train, y_train)
+
 
 # You don't have to change this function
 def calculate_cost(ground_truth: np.ndarray, predictions: np.ndarray, area_flags: np.ndarray) -> float:
